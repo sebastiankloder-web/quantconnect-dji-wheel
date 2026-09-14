@@ -1,7 +1,9 @@
 import datetime
+import math
 
 import yfinance as yf
 
+# Stocks to scan
 DJI_TICKERS = [
     "AAPL", "AMGN", "AXP", "BA", "CAT", "CRM", "CSCO", "DIS", "HD", "HON",
     "IBM", "JNJ", "JPM", "KO", "MCD", "MMM", "MRK", "MSFT", "NKE", "NVDA",
@@ -9,86 +11,296 @@ DJI_TICKERS = [
 ]
 
 
+# Wheel strategy settings
+MIN_DAYS = 30
+MAX_DAYS = 45
+
+MIN_DELTA = 0.20
+MAX_DELTA = 0.30
+
+MIN_VOLUME = 100
+MIN_OPEN_INTEREST = 500
+
+MAX_STOCK_ALLOCATION = 0.10
+
+
+def normal_cdf(x):
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def calculate_put_delta(stock_price, strike, days, volatility):
+    """Calculate approximate Black-Scholes put Delta."""
+
+    if stock_price <= 0:
+        return 0
+
+    if strike <= 0:
+        return 0
+
+    if volatility <= 0:
+        return 0
+
+    if days <= 0:
+        return 0
+
+    time = days / 365
+
+    d1 = (
+        math.log(stock_price / strike)
+        + (0.5 * volatility ** 2) * time
+    ) / (volatility * math.sqrt(time))
+
+    delta = normal_cdf(d1) - 1
+
+    return abs(delta)
+
+
 def find_best_put(capital=1_000_000):
-    today = datetime.date.today()
+
+    today = datetime.date.today()  # noqa: DTZ011
+
     best_put = None
     best_score = 0
 
     print("Scanning Dow Jones stocks...\n")
 
     for symbol in DJI_TICKERS:
+
         try:
+            # -------------------------
+            # STOCK DATA
+            # -------------------------
+
             stock = yf.Ticker(symbol)
+
             price = stock.fast_info["lastPrice"]
 
-            for expiration in stock.options:
-                expiration_date = datetime.date.fromisoformat(expiration)
-                days = (expiration_date - today).days
+            # Maximum amount of capital
+            # allowed for one stock
+            max_stock_capital = (
+                capital * MAX_STOCK_ALLOCATION
+            )
 
-                # Only look at options 30-60 days away
-                if days < 30 or days > 60:
+            # -------------------------
+            # EXPIRATIONS
+            # -------------------------
+
+            for expiration in stock.options:
+
+                expiration_date = (
+                    datetime.date.fromisoformat(expiration)
+                )
+
+                days = (
+                    expiration_date - today
+                ).days
+
+                # Only consider 30-45 DTE
+                if days < MIN_DAYS or days > MAX_DAYS:
                     continue
 
-                puts = stock.option_chain(expiration).puts
+                # -------------------------
+                # OPTION CHAIN
+                # -------------------------
+
+                puts = stock.option_chain(
+                    expiration
+                ).puts
 
                 for _, put in puts.iterrows():
+
                     strike = put["strike"]
-                    premium = put["bid"]
-
-                    # Use last price if there is no bid
-                    if premium <= 0:
-                        premium = put["lastPrice"]
-
-                    # 2%-5% below the stock price
-                    otm = (price - strike) / price
-
-                    if otm < 0.02 or otm > 0.05:
-                        continue
-
-                    if premium <= 0 or put["impliedVolatility"] <= 0:
-                        continue
-
+                    bid = put["bid"]
+                    ask = put["ask"]
                     iv = put["impliedVolatility"]
+                    volume = put["volume"]
+                    open_interest = put["openInterest"]
 
-                    # Annualized return
-                    yearly_return = (premium / strike) * (365 / days)
+                    # -------------------------
+                    # BASIC VALIDATION
+                    # -------------------------
 
-                    # Higher is better
-                    score = yearly_return / iv
+                    if strike <= 0:
+                        continue
+
+                    if bid <= 0:
+                        continue
+
+                    if ask <= 0:
+                        continue
+
+                    if iv <= 0:
+                        continue
+
+                    # -------------------------
+                    # LIQUIDITY
+                    # -------------------------
+
+                    if volume < MIN_VOLUME:
+                        continue
+
+                    if open_interest < MIN_OPEN_INTEREST:
+                        continue
+
+                    # -------------------------
+                    # BID/ASK SPREAD
+                    # -------------------------
+
+                    spread = (
+                        (ask - bid)
+                        / ((bid + ask) / 2)
+                    )
+
+                    # Reject wide spreads
+                    if spread > 0.10:
+                        continue
+
+                    # -------------------------
+                    # DELTA
+                    # -------------------------
+
+                    delta = calculate_put_delta(
+                        price,
+                        strike,
+                        days,
+                        iv
+                    )
+
+                    # Only consider 0.20-0.30 Delta
+                    if delta < MIN_DELTA:
+                        continue
+
+                    if delta > MAX_DELTA:
+                        continue
+
+                    # -------------------------
+                    # PREMIUM
+                    # -------------------------
+
+                    premium = bid
+
+                    if premium <= 0:
+                        continue
+
+                    # -------------------------
+                    # ANNUALIZED YIELD
+                    # -------------------------
+
+                    annualized_yield = (
+                        premium / strike
+                    ) * (365 / days)
+
+                    # -------------------------
+                    # RISK-ADJUSTED SCORE
+                    # -------------------------
+
+                    score = (
+                        annualized_yield / iv
+                    )
+
+                    # -------------------------
+                    # CASH REQUIRED
+                    # -------------------------
+
+                    cost_per_contract = (
+                        strike * 100
+                    )
+
+                    # Maximum contracts for
+                    # this individual stock
+                    contracts = int(
+                        max_stock_capital
+                        / cost_per_contract
+                    )
+
+                    # We need at least
+                    # one contract
+                    if contracts < 1:
+                        continue
+
+                    capital_used = (
+                        contracts
+                        * cost_per_contract
+                    )
+
+                    premium_collected = (
+                        premium
+                        * 100
+                        * contracts
+                    )
+
+                    # -------------------------
+                    # BEST PUT
+                    # -------------------------
 
                     if score > best_score:
-                        best_score = score
 
-                        cost = strike * 100
-                        contracts = int(capital // cost)
+                        best_score = score
 
                         best_put = {
                             "ticker": symbol,
-                            "stock_price": round(price, 2),
+                            "stock_price": round(
+                                price, 2
+                            ),
+                            "expiration": expiration,
                             "strike": strike,
-                            "premium": premium,
+                            "premium": round(
+                                premium, 2
+                            ),
                             "days": days,
-                            "otm": f"{otm * 100:.1f}%",
+                            "delta": round(
+                                delta, 3
+                            ),
                             "iv": f"{iv * 100:.1f}%",
-                            "annual_return": f"{yearly_return * 100:.2f}%",
-                            "score": round(score, 4),
+                            "annual_return": (
+                                f"{annualized_yield * 100:.2f}%"
+                            ),
+                            "score": round(
+                                score, 4
+                            ),
+                            "volume": int(
+                                volume
+                            ),
+                            "open_interest": int(
+                                open_interest
+                            ),
+                            "spread": (
+                                f"{spread * 100:.1f}%"
+                            ),
                             "contracts": contracts,
-                            "capital_used": contracts * cost
+                            "capital_used": (
+                                capital_used
+                            ),
+                            "premium_collected": round(
+                                premium_collected, 2
+                            )
                         }
 
-        except Exception:
-            continue
+        except Exception as e:  # noqa: BLE001
+
+            print(
+                f"{symbol}: {e}"
+            )
 
     return best_put
 
 
 if __name__ == "__main__":
+
     result = find_best_put()
 
-    print("=== BEST DOW JONES PUT ===")
+    print("\n=== BEST WHEEL PUT ===")
 
     if result:
+
         for name, value in result.items():
-            print(f"{name.replace('_', ' ').title():<20}: {value}")
+
+            print(
+                f"{name.replace('_', ' ').title():<22}: {value}"
+            )
+
     else:
-        print("No suitable put options found.")
+
+        print(
+            "No suitable put options found."
+        )
