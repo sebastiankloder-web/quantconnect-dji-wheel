@@ -10,9 +10,15 @@ DJI_TICKERS = [
     "MRK", "MSFT", "NKE", "NVDA", "PG", "SHW", "TRV", "UNH", "V", "WMT"
 ]
 
+
 # Strategy settings
 MIN_DAYS, MAX_DAYS = 30, 45
+
+MIN_RSI = 35
+RSI_PERIOD = 14
+
 MIN_DELTA, MAX_DELTA = 0.20, 0.30
+
 MIN_VOLUME = 100
 MIN_OPEN_INTEREST = 500
 
@@ -21,41 +27,101 @@ def normal_cdf(x):
     return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
 
+def calculate_rsi(prices, period=14):
+    changes = prices.diff()
+
+    gains = changes.clip(lower=0)
+    losses = -changes.clip(upper=0)
+
+    average_gain = gains.rolling(period).mean()
+    average_loss = losses.rolling(period).mean()
+
+    rs = average_gain / average_loss
+
+    rsi = 100 - (100 / (1 + rs))
+
+    return rsi.iloc[-1]
+
+
 def calculate_put_delta(stock_price, strike, days, volatility):
     """Calculate approximate Black-Scholes put Delta."""
+
     if stock_price <= 0 or strike <= 0 or volatility <= 0 or days <= 0:
         return 0
 
     time = days / 365
+
     d1 = (
-        math.log(stock_price / strike) + (0.5 * volatility**2) * time
+        math.log(stock_price / strike)
+        + (0.5 * volatility**2) * time
     ) / (volatility * math.sqrt(time))
 
     return abs(normal_cdf(d1) - 1)
 
 
-def find_best_put():
+def scan_for_put_candidates():
     today = datetime.date.today()
-    best_put = None
-    best_score = 0
+
+    valid_candidates = []
 
     print("Scanning Dow Jones stocks...\n")
 
     for symbol in DJI_TICKERS:
+
         try:
             stock = yf.Ticker(symbol)
+
+            # -------------------------
+            # STOCK PRICE
+            # -------------------------
+
             price = stock.fast_info["lastPrice"]
 
-            for expiration in stock.options:
-                expiration_date = datetime.date.fromisoformat(expiration)
-                days = (expiration_date - today).days
+            # -------------------------
+            # RSI
+            # -------------------------
 
+            history = stock.history(period="3mo")
+
+            if history.empty:
+                continue
+
+            rsi = calculate_rsi(
+                history["Close"],
+                RSI_PERIOD
+            )
+
+            # Only keep oversold stocks
+            if rsi > MIN_RSI:
+                continue
+
+            # -------------------------
+            # FIND BEST PUT FOR STOCK
+            # -------------------------
+
+            best_contract = None
+            max_yield_per_exposure = 0
+
+            for expiration in stock.options:
+
+                expiration_date = datetime.date.fromisoformat(
+                    expiration
+                )
+
+                days = (
+                    expiration_date - today
+                ).days
+
+                # Only 30-45 DTE
                 if not (MIN_DAYS <= days <= MAX_DAYS):
                     continue
 
-                puts = stock.option_chain(expiration).puts
+                puts = stock.option_chain(
+                    expiration
+                ).puts
 
                 for _, put in puts.iterrows():
+
                     strike = put["strike"]
                     bid = put["bid"]
                     ask = put["ask"]
@@ -63,53 +129,159 @@ def find_best_put():
                     volume = put["volume"]
                     open_interest = put["openInterest"]
 
-                    # Basic validation & liquidity filters
-                    if strike <= 0 or bid <= 0 or ask <= 0 or iv <= 0:
-                        continue
-                    if volume < MIN_VOLUME or open_interest < MIN_OPEN_INTEREST:
+                    # -------------------------
+                    # BASIC VALIDATION
+                    # -------------------------
+
+                    if strike <= 0:
                         continue
 
-                    # Delta evaluation
-                    delta = calculate_put_delta(price, strike, days, iv)
-                    if not (MIN_DELTA <= delta <= MAX_DELTA):
+                    if bid <= 0:
                         continue
 
-                    # Scoring
+                    if ask <= 0:
+                        continue
+
+                    if iv <= 0:
+                        continue
+
+                    # -------------------------
+                    # LIQUIDITY
+                    # -------------------------
+
+                    if volume < MIN_VOLUME:
+                        continue
+
+                    if open_interest < MIN_OPEN_INTEREST:
+                        continue
+
+                    # -------------------------
+                    # DELTA
+                    # -------------------------
+
+                    delta = calculate_put_delta(
+                        price,
+                        strike,
+                        days,
+                        iv
+                    )
+
+                    if not (
+                        MIN_DELTA <= delta <= MAX_DELTA
+                    ):
+                        continue
+
+                    # -------------------------
+                    # CAPITAL REQUIRED
+                    # -------------------------
+
+                    capital_required = (
+                        strike * 100
+                    )
+
+                    # -------------------------
+                    # YIELD PER EXPOSURE
+                    # -------------------------
+
                     premium = bid
-                    annualized_yield = (premium / strike) * (365 / days)
-                    score = annualized_yield / iv
 
-                    if score > best_score:
-                        best_score = score
-                        best_put = {
+                    yield_per_exposure = (
+                        premium / capital_required
+                    )
+
+                    # -------------------------
+                    # BEST PUT FOR THIS STOCK
+                    # -------------------------
+
+                    if (
+                        yield_per_exposure
+                        > max_yield_per_exposure
+                    ):
+
+                        max_yield_per_exposure = (
+                            yield_per_exposure
+                        )
+
+                        best_contract = {
                             "ticker": symbol,
-                            "stock_price": round(price, 2),
+                            "stock_price": round(
+                                price, 2
+                            ),
                             "expiration": expiration,
                             "strike": strike,
-                            "premium": round(premium, 2),
+                            "premium": round(
+                                premium, 2
+                            ),
                             "days": days,
-                            "delta": round(delta, 3),
+                            "delta": round(
+                                delta, 3
+                            ),
+                            "rsi": round(
+                                rsi, 2
+                            ),
                             "iv": f"{iv * 100:.1f}%",
-                            "annual_return": f"{annualized_yield * 100:.2f}%",
-                            "score": round(score, 4),
-                            "volume": int(volume),
-                            "open_interest": int(open_interest),
-                            "collateral_required": strike * 100,
-                            "premium_collected": round(premium * 100, 2),
+                            "yield_per_exposure": (
+                                f"{yield_per_exposure * 100:.2f}%"
+                            ),
+                            "volume": int(
+                                volume
+                            ),
+                            "open_interest": int(
+                                open_interest
+                            ),
+                            "collateral_required": (
+                                capital_required
+                            ),
+                            "premium_collected": round(
+                                premium * 100,
+                                2
+                            ),
                         }
+
+            # -------------------------
+            # ADD BEST PUT FOR STOCK
+            # -------------------------
+
+            if best_contract is not None:
+                valid_candidates.append(
+                    best_contract
+                )
 
         except Exception as e:
             print(f"{symbol}: {e}")
 
-    return best_put
+    # -------------------------
+    # SORT ALL CANDIDATES
+    # -------------------------
+
+    valid_candidates.sort(
+        key=lambda x: x["yield_per_exposure"],
+        reverse=True
+    )
+
+    return valid_candidates
 
 
 if __name__ == "__main__":
-    result = find_best_put()
 
-    print("\n=== BEST WHEEL PUT ===")
-    if result:
-        for name, value in result.items():
-            print(f"{name.replace('_', ' ').title():<22}: {value}")
+    candidates = scan_for_put_candidates()
+
+    print("\n=== WHEEL PUT CANDIDATES ===")
+
+    if candidates:
+
+        for candidate in candidates:
+
+            print("\n-------------------------")
+
+            for name, value in candidate.items():
+
+                print(
+                    f"{name.replace('_', ' ').title():<24}: {value}"
+                )
+
     else:
-        print("No suitable put options found.")
+
+        print(
+            "No suitable put options found."
+        )
