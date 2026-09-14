@@ -1,0 +1,94 @@
+import datetime
+
+import yfinance as yf
+
+DJI_TICKERS = [
+    "AAPL", "AMGN", "AXP", "BA", "CAT", "CRM", "CSCO", "DIS", "HD", "HON",
+    "IBM", "JNJ", "JPM", "KO", "MCD", "MMM", "MRK", "MSFT", "NKE", "NVDA",
+    "PG", "SHW", "TRV", "UNH", "V", "VZ", "WMT", "AMZN", "GS"
+]
+
+
+def find_best_put(capital=1_000_000):
+    today = datetime.date.today()
+    best_put = None
+    best_score = 0
+
+    print("Scanning Dow Jones stocks...\n")
+
+    for symbol in DJI_TICKERS:
+        try:
+            stock = yf.Ticker(symbol)
+            price = stock.fast_info["lastPrice"]
+
+            for expiration in stock.options:
+                expiration_date = datetime.date.fromisoformat(expiration)
+                days = (expiration_date - today).days
+
+                # Only look at options 30-60 days away
+                if days < 30 or days > 60:
+                    continue
+
+                puts = stock.option_chain(expiration).puts
+
+                for _, put in puts.iterrows():
+                    strike = put["strike"]
+                    premium = put["bid"]
+
+                    # Use last price if there is no bid
+                    if premium <= 0:
+                        premium = put["lastPrice"]
+
+                    # 2%-5% below the stock price
+                    otm = (price - strike) / price
+
+                    if otm < 0.02 or otm > 0.05:
+                        continue
+
+                    if premium <= 0 or put["impliedVolatility"] <= 0:
+                        continue
+
+                    iv = put["impliedVolatility"]
+
+                    # Annualized return
+                    yearly_return = (premium / strike) * (365 / days)
+
+                    # Higher is better
+                    score = yearly_return / iv
+
+                    if score > best_score:
+                        best_score = score
+
+                        cost = strike * 100
+                        contracts = int(capital // cost)
+
+                        best_put = {
+                            "ticker": symbol,
+                            "stock_price": round(price, 2),
+                            "strike": strike,
+                            "premium": premium,
+                            "days": days,
+                            "otm": f"{otm * 100:.1f}%",
+                            "iv": f"{iv * 100:.1f}%",
+                            "annual_return": f"{yearly_return * 100:.2f}%",
+                            "score": round(score, 4),
+                            "contracts": contracts,
+                            "capital_used": contracts * cost
+                        }
+
+        except Exception:
+            continue
+
+    return best_put
+
+
+if __name__ == "__main__":
+    result = find_best_put()
+
+    print("=== BEST DOW JONES PUT ===")
+
+    if result:
+        for name, value in result.items():
+            print(f"{name.replace('_', ' ').title():<20}: {value}")
+    else:
+        print("No suitable put options found.")
